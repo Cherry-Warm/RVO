@@ -1,6 +1,9 @@
 import torch
 import os
 import torch.nn as nn
+from torchvision.models import resnet34
+from torchvision.transforms import transforms
+
 import utils
 from config import config
 import numpy as np
@@ -8,31 +11,45 @@ import random
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.model_selection import KFold
 from torch.utils.data import DataLoader,SubsetRandomSampler
+
 from valid import valid
-from hovertrans import create_model
+from hovertrans import hovernet
 from utils import confusion_matrix
 import math
 
 
-def train(config, train_loader, test_loader, fold, test_idx):                                        
+def train(config, train_loader, test_loader, fold, test_idx):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    # MODEL
-    model = create_model(img_size=config.img_size, num_classes=config.class_num, drop_rate=0.1, attn_drop_rate=0.1,
-            patch_size=config.patch_size, dim=config.dim, depth=config.depth, num_heads=config.num_heads,
-            num_inner_head=config.num_inner_head)
-    model = model.to(device)
-    model.train()
+    # NET
+    # net = hovernet(img_size=config.img_size, num_classes=config.class_num, drop_rate=0.1, attn_drop_rate=0.1,
+    #         patch_size=config.patch_size, dim=config.dim, depth=config.depth, num_heads=config.num_heads,
+    #         num_inner_head=config.num_inner_head)
+
+    # public net
+    net = resnet34(pretrained=True)
+    # net_weight_path = "./weight/resnet34-333f7ec4.pth"
+    # assert os.path.exists(net_weight_path), "file {} does not exist.".format(net_weight_path)
+    # net.load_state_dict(torch.load(net_weight_path, map_location='cpu'))
+    # for param in net.parameters():
+    #     param.requires_grad = False
+
+    # change fc layer structure
+    in_channel = net.fc.in_features
+    net.fc = nn.Linear(in_channel, config.class_num)
+
+    net = net.to(device)
+    net.train()
 
     if config.loss_function == 'CE':
         criterion = nn.CrossEntropyLoss().to(device)
 
     if config.optimizer == 'Adam':
-        optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+        optimizer = torch.optim.Adam(net.parameters(), lr=config.lr)
     elif config.optimizer == 'AdamW':
-        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
+        optimizer = torch.optim.AdamW(net.parameters(), lr=config.lr)
     elif config.optimizer == 'SGD':
-        optimizer = torch.optim.SGD(model.parameters(), lr=config.lr, momentum=0.9, weight_decay=5e-4)
+        optimizer = torch.optim.SGD(net.parameters(), lr=config.lr, momentum=0.9, weight_decay=5e-4)
 
     if config.scheduler == 'cosine':
         lr_lambda = lambda epoch:(epoch*(1-config.warmup_decay)/config.warmup_epochs+config.warmup_decay) \
@@ -42,14 +59,15 @@ def train(config, train_loader, test_loader, fold, test_idx):
     elif config.scheduler == 'step':
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=config.step, gamma=0.9)
 
-    writer = SummaryWriter(comment='_'+config.model_name+'_'+config.writer_comment+'_'+str(fold))
+    writer = SummaryWriter(comment='_'+config.net_name+'_'+config.writer_comment+'_'+str(fold))
     
     print("START TRAINING")
     best_acc=0
-    ckpt_path = os.path.join(config.model_path, config.model_name, config.writer_comment)
-    model_save_path = os.path.join(ckpt_path, str(fold))
+    ckpt_path = os.path.join(config.net_path, config.writer_comment, config.net_name)
+    net_save_path = os.path.join(ckpt_path, str(fold))
     cm = None
     for epoch in range(config.epochs):
+        y_true, y_pred = [], []
         cm = torch.zeros((config.class_num, config.class_num))
         epoch_loss = 0
         for i, pack in enumerate(train_loader):
@@ -59,11 +77,13 @@ def train(config, train_loader, test_loader, fold, test_idx):
             labels = pack['labels'].to(device)
             names = pack['names']
 
-            output = model(images)
+            output = net(images)
 
             loss = criterion(output, labels)
 
             pred = output.argmax(dim=1)
+            y_pred.append(pred)
+            y_true.append(labels.tolist()[0])
 
             optimizer.zero_grad()
             loss.backward()
@@ -72,11 +92,12 @@ def train(config, train_loader, test_loader, fold, test_idx):
             epoch_loss += loss.item()
             cm = confusion_matrix(pred.detach(), labels.detach(), cm)
         lr_scheduler.step()
+        # cm = utils.calculate_confusion_matrix(y_pred, y_true, config.class_num)
         
         if (epoch + 1) % config.log_step == 0:
             print('[epoch %d]' % epoch)
             with torch.no_grad():
-                result = valid(config, model, test_loader, criterion)
+                result = valid(config, net, test_loader, criterion)
             val_loss, val_acc, sen, spe, auc, pre, f1score = result
             writer.add_scalar('Val/F1score', f1score, global_step=epoch)
             writer.add_scalar('Val/Pre', pre, global_step=epoch)
@@ -89,22 +110,22 @@ def train(config, train_loader, test_loader, fold, test_idx):
             if epoch > config.epochs//4:
                 if val_acc>best_acc:
                     best_acc=val_acc
-                    print("=> saved best model")
-                    if not os.path.exists(model_save_path):
-                        os.makedirs(model_save_path)
-                    if config.save_model:
-                        torch.save(model.state_dict(), os.path.join(model_save_path, 'bestmodel.pth'))
-                    with open(os.path.join(model_save_path, 'result.txt'), 'w') as f:
+                    print("=> saved best net")
+                    if not os.path.exists(net_save_path):
+                        os.makedirs(net_save_path)
+                    if config.save_net:
+                        torch.save(net.state_dict(), os.path.join(net_save_path, 'bestnet.pth'))
+                    with open(os.path.join(net_save_path, 'result.txt'), 'w') as f:
                         f.write('Best Result:\n')
                         f.write('Acc: %f, Spe: %f, Sen: %f, AUC: %f, Pre: %f, F1score: %f'
                                 % (val_acc, spe, sen, auc, pre, f1score))
         if epoch+1==config.epochs:
             with torch.no_grad():
-                result = valid(config, model, test_loader, criterion)
+                result = valid(config, net, test_loader, criterion)
             val_loss, val_acc, sen, spe, auc, pre, f1score = result
-            if config.save_model:
-                torch.save(model.state_dict(), os.path.join(model_save_path, 'last_epoch_model.pth'))
-            with open(os.path.join(model_save_path, 'result.txt'), 'a') as f:
+            if config.save_net:
+                torch.save(net.state_dict(), os.path.join(net_save_path, 'last_epoch_net.pth'))
+            with open(os.path.join(net_save_path, 'result.txt'), 'a') as f:
                 f.write('\nLast Result:\n')
                 f.write('Acc: %f, Spe: %f, Sen: %f, AUC: %f, Pre: %f, F1score: %f'
                         % (val_acc, spe, sen, auc, pre, f1score))
@@ -133,13 +154,14 @@ if __name__ == '__main__':
     args = config()
     cv=KFold(n_splits=args.fold, random_state=42, shuffle=True)
     fold=0
+
     train_set = utils.get_dataset(args.data_path, args.csv_path, args.img_size, mode='train')
     test_set = utils.get_dataset(args.data_path, args.csv_path, args.img_size, mode='test')
     print(args)
-    argspath = os.path.join(args.model_path, args.model_name, args.writer_comment)
+    argspath = os.path.join(args.net_path, args.writer_comment, args.net_name)
     if not os.path.exists(argspath):
         os.makedirs(argspath)
-    with open(os.path.join(argspath, 'model_info.txt'), 'w') as f:
+    with open(os.path.join(argspath, 'net_info.txt'), 'w') as f:
         f.write(str(args))
 
     for train_idx,test_idx in cv.split(train_set):

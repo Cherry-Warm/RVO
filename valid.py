@@ -1,7 +1,6 @@
 import torch
-from utils import confusion_matrix
+from utils import confusion_matrix, calculate_confusion_matrix, cal_TPNF
 from sklearn.metrics import roc_auc_score
-
 
 def valid(config, net, val_loader, criterion):                                       
     device = next(net.parameters()).device
@@ -31,16 +30,24 @@ def valid(config, net, val_loader, criterion):
         epoch_loss += loss.cpu()
             
     avg_epoch_loss = epoch_loss / len(val_loader)
+    # cm = calculate_confusion_matrix(y_score, y_true, config.class_num)
 
     #   t  N  P
     # p
     # N    TN FN
     # P    FP TP
-    acc = cm.diag().sum() / cm.sum()
-    spe, sen = cm.diag() / (cm.sum(dim=0) + 1e-6)
-    pre = cm.diag()[1] / (cm.sum(dim=1) + 1e-6)[1]
+
+    TP, FN, TN, FP = cal_TPNF(cm)
+
+    # acc = cm.diag().sum() / cm.sum()
+    acc = (TP + TN) / cm.sum()
+    sen = TP / (TP + FN)
+    spe = TN / (TN + FP)
+    # pre = cm.diag()[1] / (cm.sum(dim=1) + 1e-6)[1]
+    pre = TP / (TP + FP)
     rec = sen
     f1score = 2*pre*rec / (pre+rec+ 1e-6)
-    auc = roc_auc_score(y_true, y_score)
+    # auc = roc_auc_score(y_true, y_score)
+    auc = (sen + spe) / 2
     
     return [avg_epoch_loss, acc, sen, spe, auc, pre, f1score]

@@ -340,6 +340,6 @@ class HoverTrans(nn.Module):
 
         return output_flat
 
-def create_model(embed_dim=640, **kwargs):
+def hovernet(embed_dim=640, **kwargs):
     model = HoverTrans(embed_dim=embed_dim, **kwargs)
     return model
